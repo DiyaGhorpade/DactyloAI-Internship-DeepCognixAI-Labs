@@ -32,7 +32,7 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 models_dir = BASE_DIR / "models"
-DATA_PATH = BASE_DIR / ".csv"
+DATA_PATH = BASE_DIR / "blood_fingerprint_FULL.csv"
 
 # ---------- LOAD SAVEDMODEL FORMAT (Cross-version compatible) ----------
 def load_savedmodel_safe(path: Path, model_name: str):
