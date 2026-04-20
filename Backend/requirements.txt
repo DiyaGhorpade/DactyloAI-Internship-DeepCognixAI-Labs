@@ -1,3 +1,6 @@
-flask
-tensorflow
-pillow
+fastapi
+uvicorn
+google-cloud-storage
+tensorflow-cpu
+numpy
+pandas
