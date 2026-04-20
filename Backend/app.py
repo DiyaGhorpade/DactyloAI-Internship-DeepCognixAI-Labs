@@ -10,13 +10,18 @@ import uvicorn
 import cv2
 import tensorflow as tf
 import traceback
-import os
-import zipfile
-import gdown
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use("Agg")  
+import base64
+from io import BytesIO
+from scipy.stats import chi2_contingency
 
-# ---------- FASTAPI INIT ----------
 app = FastAPI(title="DactyloAI Backend API")
 
+# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,139 +31,181 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+models_dir = BASE_DIR / "models"
 DATA_PATH = BASE_DIR / "blood_fingerprint_FULL.csv"
 
-# ---------- DOWNLOAD MODELS FROM GDRIVE ----------
-def download_models():
-    base_dir = Path("/tmp/models")
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    models = {
-        "efficientnet": {
-            "id": "1f0ouU632M4-SVLXJMsctrBC87LhI3bft",
-            "zip": base_dir / "efficientnet.zip",
-            "extract_to": base_dir / "efficientnet_savedmodel"
-        },
-        "inception": {
-            "id": "1lInh8yjFc2tasW5i7glD86VwveF-HWuT",
-            "zip": base_dir / "inception.zip",
-            "extract_to": base_dir / "inceptionv3_savedmodel"
-        }
-    }
-
-    for name, info in models.items():
-        if not info["extract_to"].exists():
-            print(f"📥 Downloading {name}...")
-
-            url = f"https://drive.google.com/uc?id={info['id']}"
-            gdown.download(url, str(info["zip"]), quiet=False)
-
-            print(f"📦 Extracting {name}...")
-            with zipfile.ZipFile(info["zip"], 'r') as zip_ref:
-                zip_ref.extractall(info["extract_to"])
-
-    return base_dir
-
-# ✅ IMPORTANT: actually call it
-models_dir = download_models()
-
-# ---------- LOAD MODELS ----------
+# ---------- LOAD SAVEDMODEL FORMAT (Cross-version compatible) ----------
 def load_savedmodel_safe(path: Path, model_name: str):
+    """Load SavedModel format (works across TF versions)"""
     if not path.exists():
-        print(f"❌ Model not found: {path}")
+        print(f"❌ Model directory not found: {path}")
         return None
 
     try:
-        print(f"🔄 Loading {model_name}...")
+        print(f"🔄 Loading {model_name} from {path}...")
         model = tf.saved_model.load(str(path))
+        # Get the inference function
         infer = model.signatures["serving_default"]
-        print(f"✅ {model_name} loaded")
+        print(f"✅ {model_name} loaded successfully")
         return infer
     except Exception as e:
         print(f"❌ Failed loading {model_name}: {e}")
         traceback.print_exc()
         return None
 
-print("🚀 Loading models...")
+# ---------- LOAD MODELS ----------
+print("🚀 Starting model loading...")
 
+# SavedModel paths (unzipped directories)
 efficient_model_path = models_dir / "efficientnet_savedmodel"
 inception_model_path = models_dir / "inceptionv3_savedmodel"
 blood_model_path = models_dir / "model_blood_group_detection.keras"
 
+# Load fingerprint models
 efficient_model = load_savedmodel_safe(efficient_model_path, "EfficientNet")
 inception_model = load_savedmodel_safe(inception_model_path, "InceptionV3")
 
-# Blood model (optional)
+# Load blood model (assuming it's compatible)
 if blood_model_path.exists():
     try:
         blood_model = tf.keras.models.load_model(str(blood_model_path), compile=False)
         print("✅ Blood model loaded")
     except:
         blood_model = None
-        print("❌ Blood model failed")
+        print("❌ Blood model failed to load")
 else:
     blood_model = None
 
-# ---------- LABELS ----------
+# Check if models loaded
+if efficient_model is None and inception_model is None:
+    print("💥 WARNING: No fingerprint models were loaded successfully!")
+
+# --- Define Class Labels ---
 PATTERN_TYPES = ["class1_arc", "class2_whorl", "class3_loop"]
 BLOOD_TYPES = ["A+", "A-", "AB+", "AB-", "B+", "B-", "O+", "O-"]
 ENSEMBLE_WEIGHTS = {'efficientnet': 0.55, 'inception': 0.45}
 
-# ---------- PREPROCESS ----------
-def preprocess_image(img_bytes, target_size):
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    img = np.array(img)
+# ---------- PREPROCESSING ----------
+def preprocess_image_for_prediction(img_bytes: bytes, target_size: tuple) -> np.ndarray:
+    """Preprocess image for prediction"""
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        img_array = np.array(img)
 
-    img = cv2.resize(img, (target_size[1], target_size[0]))
-    img = np.expand_dims(img.astype(np.float32), axis=0)
+        # Ensure 3 channels
+        if img_array.ndim == 2:
+            img_array = np.stack([img_array]*3, axis=-1)
+        elif img_array.shape[-1] == 1:
+            img_array = np.concatenate([img_array]*3, axis=-1)
+        elif img_array.shape[-1] == 4:
+            img_array = img_array[:, :, :3]
 
-    return img
+        # Resize
+        target_size_int = (int(target_size[1]), int(target_size[0]))
+        img_array_resized = cv2.resize(img_array, target_size_int, interpolation=cv2.INTER_AREA)
+        
+        # Convert to float32 and add batch dimension
+        img_batch = np.expand_dims(img_array_resized.astype(np.float32), axis=0)
+        return img_batch
 
-# ---------- FINGERPRINT ----------
+    except Exception as e:
+        print(f"❌ Image preprocessing failed: {e}")
+        raise ValueError(f"Failed to preprocess image: {e}")
+
+
+
+
+# ---------- FINGERPRINT PREDICTION ----------
 @app.post("/predict/fingerprint")
 async def predict_fingerprint(file: UploadFile = File(...)):
-    if not (efficient_model or inception_model):
-        return JSONResponse(status_code=503, content={"error": "No models loaded"})
+    available_models = [m for m in [inception_model, efficient_model] if m is not None]
+    if not available_models:
+        return JSONResponse(status_code=503, content={"error": "No fingerprint models available"})
 
     try:
+        print(f"🎯 Received fingerprint prediction request: {file.filename}")
         img_bytes = await file.read()
-        img = preprocess_image(img_bytes, (224, 224))
-        img_tensor = tf.convert_to_tensor(img)
 
-        preds = []
-        weights = []
+        # Preprocess image
+        img_batch = preprocess_image_for_prediction(img_bytes, target_size=(224, 224))
+        
+        # Convert to TensorFlow tensor
+        img_tensor = tf.convert_to_tensor(img_batch, dtype=tf.float32)
 
-        if inception_model:
-            out = inception_model(input_layer_3=img_tensor)
-            key = list(out.keys())[0]
-            preds.append(out[key].numpy())
-            weights.append(ENSEMBLE_WEIGHTS["inception"])
+        predictions = []
+        model_weights = []
+        per_model_confidences = {}
 
-        if efficient_model:
-            out = efficient_model(input_layer_2=img_tensor)
-            key = list(out.keys())[0]
-            preds.append(out[key].numpy())
-            weights.append(ENSEMBLE_WEIGHTS["efficientnet"])
+        # Run predictions
+        # Run predictions with CORRECT input names
+        if inception_model is not None:
+            try:
+                print("🔄 Running Inception prediction...")
+                pred_inc = inception_model(input_layer_3=img_tensor)  # ✅ CORRECT
+                output_key = list(pred_inc.keys())[0]
+                pred_inc_array = pred_inc[output_key].numpy()
+                predictions.append(pred_inc_array)
+                model_weights.append(ENSEMBLE_WEIGHTS['inception'])
+                per_model_confidences["inception"] = float(np.max(pred_inc_array[0]))
+            except Exception as e:
+                print(f"⚠️ Inception prediction failed: {e}")
+                traceback.print_exc()
 
-        # Ensemble
-        if len(preds) > 1:
-            total = sum(weights)
-            final = sum(p * (w / total) for p, w in zip(preds, weights))[0]
+        if efficient_model is not None:
+            try:
+                print("🔄 Running EfficientNet prediction...")
+                pred_eff = efficient_model(input_layer_2=img_tensor)  # ✅ CORRECT
+                output_key = list(pred_eff.keys())[0]
+                pred_eff_array = pred_eff[output_key].numpy()
+                predictions.append(pred_eff_array)
+                model_weights.append(ENSEMBLE_WEIGHTS['efficientnet'])
+                per_model_confidences["efficientnet"] = float(np.max(pred_eff_array[0]))
+            except Exception as e:
+                print(f"⚠️ EfficientNet prediction failed: {e}")
+                traceback.print_exc()
+
+
+        if not predictions:
+            return JSONResponse(status_code=500, content={"error": "All predictions failed"})
+
+        # Weighted ensemble
+        if len(predictions) > 1:
+            total_weight = sum(model_weights)
+            normalized_weights = [w / total_weight for w in model_weights]
+            ensemble = sum(pred * weight for pred, weight in zip(predictions, normalized_weights))
+            final_probs = ensemble[0]
+            model_used_str = "weighted_ensemble"
         else:
-            final = preds[0][0]
+            final_probs = predictions[0][0]
+            model_used_str = "inception" if inception_model else "efficientnet"
 
-        idx = int(np.argmax(final))
+        # Get final prediction
+        idx = int(np.argmax(final_probs))
+        confidence = float(final_probs[idx])
+        pattern = PATTERN_TYPES[idx]
+
+        print(f"🎯 Final prediction: {pattern} (confidence: {confidence:.4f})")
 
         return {
-            "pattern": PATTERN_TYPES[idx],
-            "confidence": float(final[idx])
+            "pattern": pattern,
+            "class": idx,
+            "confidence": confidence,
+            "model_used": model_used_str,
+            "probabilities": {
+                PATTERN_TYPES[i]: float(final_probs[i])
+                for i in range(len(PATTERN_TYPES))
+            },
+            "per_model_confidence": per_model_confidences,
         }
 
     except Exception as e:
+        print(f"💥 Fingerprint prediction error: {e}")
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# ---------- BLOOD ----------
+# ---------- BLOOD PREDICTION ----------
 @app.post("/predict/blood")
 async def predict_blood(file: UploadFile = File(...)):
     if blood_model is None:
@@ -166,33 +213,50 @@ async def predict_blood(file: UploadFile = File(...)):
 
     try:
         img_bytes = await file.read()
-        img = preprocess_image(img_bytes, (256, 256))
-        img = resnet_preprocess(img)
-
-        pred = blood_model.predict(img)
-        idx = int(np.argmax(pred[0]))
+        img_batch = preprocess_image_for_prediction(img_bytes, target_size=(256, 256))
+        x_blood = resnet_preprocess(img_batch)
+        pred = blood_model.predict(x_blood, verbose=0)
+        final_probs = pred[0]
+        idx = int(np.argmax(final_probs))
+        confidence = float(final_probs[idx])
+        blood_type = BLOOD_TYPES[idx]
 
         return {
-            "blood_type": BLOOD_TYPES[idx],
-            "confidence": float(pred[0][idx])
+            "blood_type": blood_type,
+            "confidence": confidence,
+            "probabilities": {
+                BLOOD_TYPES[i]: float(final_probs[i])
+                for i in range(len(BLOOD_TYPES))
+            },
         }
 
     except Exception as e:
+        print(f"💥 Blood prediction erro+r: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+# ---------------------- ANALYTICS API ----------------------
+from fastapi.staticfiles import StaticFiles
+from services.analytics_engine import run_analytics
 
-# ---------- HEALTH ----------
+# Serve static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/analytics")
+def analytics():
+    return run_analytics()
+
+     
+# ---------- HEALTH CHECK ----------
 @app.get("/")
-def health():
+async def health_check():
     return {
-        "status": "running",
-        "models": {
-            "efficientnet": efficient_model is not None,
+        "status": "API is running",
+        "models_loaded": {
             "inception": inception_model is not None,
+            "efficientnet": efficient_model is not None,
             "blood": blood_model is not None
         }
     }
 
-# ---------- ENTRY ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print("🚀 Starting DactyloAI FastAPI server...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
