@@ -35,12 +35,12 @@ def download_models():
 
     models = {
         "efficientnet": {
-            "id": "1NswGilnqR3vwRikPC0IXeLKBx47JsB7d",
+            "id": "1f0ouU632M4-SVLXJMsctrBC87LhI3bft",
             "zip": base_dir / "efficientnet.zip",
             "extract_to": base_dir / "efficientnet_savedmodel"
         },
         "inception": {
-            "id": "1TVFTCfiJ2QnzuYjHqpfV8URhCq1-VeFy",
+            "id": "1lInh8yjFc2tasW5i7glD86VwveF-HWuT",
             "zip": base_dir / "inception.zip",
             "extract_to": base_dir / "inceptionv3_savedmodel"
         }
