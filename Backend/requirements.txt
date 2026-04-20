@@ -1,6 +1,11 @@
 fastapi
 uvicorn
-google-cloud-storage
-tensorflow-cpu
+tensorflow
+opencv-python-headless
+pillow
 numpy
 pandas
+matplotlib
+seaborn
+scipy
+gdown
